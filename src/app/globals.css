@@ -1,0 +1,116 @@
+@import "tailwindcss";
+
+:root {
+  --background: #faf9f5;
+  --foreground: #2c2c2a;
+  --muted: #6b6a65;
+  --border: #e8e6dc;
+  --surface: #ffffff;
+  --surface-muted: #f3f1ea;
+  --accent: #1e454d;
+  --accent-hover: #16363d;
+  --success: #276b3a;
+  --success-bg: #eff6ee;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-success: var(--success);
+  --color-success-bg: var(--success-bg);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  min-height: 100%;
+  background:
+    radial-gradient(ellipse 90% 60% at 50% -15%, rgba(30, 69, 77, 0.14) 0%, transparent 55%),
+    radial-gradient(ellipse 70% 50% at 100% 100%, rgba(30, 69, 77, 0.06) 0%, transparent 50%),
+    linear-gradient(180deg, #eef3f3 0%, #f6f7f5 38%, #faf9f5 68%, #f5f2ec 100%);
+  background-attachment: fixed;
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, sans-serif;
+}
+
+::selection {
+  background: #efe8dd;
+  color: var(--foreground);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fade-up 0.4s ease-out both;
+}
+
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.45s ease-out both;
+}
+
+@keyframes shift-left {
+  from {
+    opacity: 0;
+    transform: translateX(40px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-shift-left {
+  animation: shift-left 0.45s ease-out both;
+}
+
+@keyframes tape-scroll-left {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes tape-scroll-right {
+  from {
+    transform: translateX(-50%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.animate-tape-scroll-left {
+  animation: tape-scroll-left 38s linear infinite;
+}
+
+.animate-tape-scroll-right {
+  animation: tape-scroll-right 44s linear infinite;
+}
