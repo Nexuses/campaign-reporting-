@@ -2,9 +2,9 @@ import { NextResponse } from "next/server";
 import {
   campaignNameFromFileName,
   describeCsvFormat,
-  deliveredCountFromFiles,
   mergeActivityFiles,
   parseCsvContent,
+  resolveSentAndDeliveredCounts,
 } from "@/lib/csv-utils";
 import { convertLeadsToReport } from "@/lib/generate-report";
 
@@ -16,6 +16,7 @@ interface ConvertedFilePayload {
   base64: string;
   stats: {
     totalSent: number;
+    totalDelivered: number;
     opens: number;
     clicks: number;
     hardBounces: number;
@@ -88,9 +89,12 @@ export async function POST(request: Request) {
 
     if (parsedFiles.length === 1) {
       const parsed = parsedFiles[0];
+      const counts = resolveSentAndDeliveredCounts(parsedFiles);
       const result = await convertLeadsToReport(parsed.rows, parsed.fileName, {
         campaignName,
         edmLabel,
+        totalSentOverride: counts.totalSent,
+        totalDeliveredOverride: counts.totalDelivered,
       });
 
       converted.push({
@@ -102,10 +106,12 @@ export async function POST(request: Request) {
     } else {
       const mergedRows = mergeActivityFiles(parsedFiles);
       const sourceFileName = fileNames.join(", ");
+      const counts = resolveSentAndDeliveredCounts(parsedFiles);
       const result = await convertLeadsToReport(mergedRows, fileNames[0] ?? "merged-campaign.csv", {
         campaignName,
         edmLabel,
-        totalSentOverride: deliveredCountFromFiles(parsedFiles),
+        totalSentOverride: counts.totalSent,
+        totalDeliveredOverride: counts.totalDelivered,
       });
 
       converted.push({

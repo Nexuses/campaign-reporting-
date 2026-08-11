@@ -6,6 +6,7 @@ type RawRow = Record<string, string | undefined>;
 export type CsvFormat = "leads-campaign" | "activity" | "brevo-campaign";
 
 export type ActivityType =
+  | "sent"
   | "delivered"
   | "opened"
   | "not-opened"
@@ -15,6 +16,7 @@ export type ActivityType =
   | "unknown";
 
 const ACTIVITY_FILE_PATTERNS: Array<{ type: ActivityType; pattern: RegExp }> = [
+  { type: "sent", pattern: /(?:^|[-_\s])sent(?:$|[-_\s.]|\.csv)/i },
   { type: "not-opened", pattern: /not[-_]opened/i },
   { type: "delivered", pattern: /delivered/i },
   { type: "clicked", pattern: /clicked|click[-_]activities/i },
@@ -24,13 +26,14 @@ const ACTIVITY_FILE_PATTERNS: Array<{ type: ActivityType; pattern: RegExp }> = [
 ];
 
 const ACTIVITY_MERGE_ORDER: Record<ActivityType, number> = {
-  delivered: 0,
-  opened: 1,
-  clicked: 2,
-  "not-opened": 3,
-  bounced: 4,
-  unsubscribed: 5,
-  unknown: 6,
+  sent: 0,
+  delivered: 1,
+  opened: 2,
+  clicked: 3,
+  "not-opened": 4,
+  bounced: 5,
+  unsubscribed: 6,
+  unknown: 7,
 };
 
 export interface ParsedCsvFile {
@@ -82,6 +85,24 @@ function detectFormat(headers: string[]): CsvFormat {
   }
 
   return "leads-campaign";
+}
+
+function inferActivityTypeFromHeaders(headers: string[]): ActivityType {
+  const normalized = headers.map(normalizeKey);
+
+  const matches: ActivityType[] = [];
+  if (normalized.includes("clicked_at")) matches.push("clicked");
+  if (normalized.includes("opened_at") && !normalized.includes("clicked_at")) {
+    matches.push("opened");
+  }
+  if (normalized.includes("bounced_at")) matches.push("bounced");
+  if (normalized.includes("unsubscribed_at")) matches.push("unsubscribed");
+  if (normalized.includes("delivered_at")) matches.push("delivered");
+  if (normalized.includes("sent_at")) matches.push("sent");
+
+  // Only infer when exactly one activity timestamp column is present,
+  // otherwise filename (or unknown) is safer than a wrong guess.
+  return matches.length === 1 ? matches[0] : "unknown";
 }
 
 function normalizeBrevoDate(value: string): string {
@@ -184,6 +205,8 @@ export function extractActivityType(fileName: string): ActivityType {
 
 export function activityTypeLabel(activityType: ActivityType): string {
   switch (activityType) {
+    case "sent":
+      return "Sent";
     case "delivered":
       return "Delivered";
     case "opened":
@@ -259,6 +282,7 @@ function normalizeActivityRow(row: RawRow, activityType: ActivityType): LeadRow 
     "opened_at",
     "bounced_at",
     "unsubscribed_at",
+    "sent_at",
     "sent_time",
   ]);
   const bounceType = pickValue(row, ["bounce_type"]);
@@ -311,7 +335,11 @@ export function parseCsvContent(content: string, fileName: string): ParsedCsvFil
   const headers = result.meta.fields ?? [];
   const format = detectFormat(headers);
   const campaignId = extractCampaignId(fileName);
-  const activityType = extractActivityType(fileName);
+  const fileNameActivityType = extractActivityType(fileName);
+  const activityType =
+    format === "activity" && fileNameActivityType === "unknown"
+      ? inferActivityTypeFromHeaders(headers)
+      : fileNameActivityType;
 
   const rows =
     format === "activity"
@@ -343,9 +371,79 @@ interface MergedLead extends LeadRow {
   is_unsubscribed: string;
 }
 
+function uniqueEmailCount(rows: LeadRow[]): number {
+  return new Set(rows.map((row) => row.email.toLowerCase())).size;
+}
+
 export function deliveredCountFromFiles(parsedFiles: ParsedCsvFile[]): number | undefined {
   const deliveredFile = parsedFiles.find((file) => file.activityType === "delivered");
-  return deliveredFile?.rows.length;
+  if (!deliveredFile) {
+    return undefined;
+  }
+
+  return uniqueEmailCount(deliveredFile.rows);
+}
+
+export function sentCountFromFiles(parsedFiles: ParsedCsvFile[]): number | undefined {
+  const sentFile = parsedFiles.find((file) => file.activityType === "sent");
+  if (!sentFile) {
+    return undefined;
+  }
+
+  return uniqueEmailCount(sentFile.rows);
+}
+
+function uniqueEmailsFromActivity(
+  parsedFiles: ParsedCsvFile[],
+  activityType: ActivityType,
+): Set<string> {
+  const emails = new Set<string>();
+  for (const file of parsedFiles) {
+    if (file.activityType !== activityType) {
+      continue;
+    }
+    for (const row of file.rows) {
+      emails.add(row.email.toLowerCase());
+    }
+  }
+  return emails;
+}
+
+/**
+ * Resolve Sent vs Delivered independently.
+ * - Sent: explicit sent file, else unique(delivered ∪ bounced)
+ * - Delivered: explicit delivered file when present
+ */
+export function resolveSentAndDeliveredCounts(parsedFiles: ParsedCsvFile[]): {
+  totalSent?: number;
+  totalDelivered?: number;
+} {
+  const sentFromFile = sentCountFromFiles(parsedFiles);
+  const deliveredFromFile = deliveredCountFromFiles(parsedFiles);
+
+  const deliveredEmails = uniqueEmailsFromActivity(parsedFiles, "delivered");
+  const bouncedEmails = uniqueEmailsFromActivity(parsedFiles, "bounced");
+
+  let totalSent = sentFromFile;
+  if (totalSent === undefined && deliveredEmails.size > 0) {
+    const sentEmails = new Set<string>([...deliveredEmails, ...bouncedEmails]);
+    totalSent = sentEmails.size;
+  }
+
+  let totalDelivered = deliveredFromFile;
+  if (
+    totalDelivered === undefined &&
+    totalSent !== undefined &&
+    bouncedEmails.size > 0
+  ) {
+    totalDelivered = Math.max(0, totalSent - bouncedEmails.size);
+  }
+
+  if (totalSent !== undefined && totalDelivered !== undefined) {
+    totalDelivered = Math.min(totalSent, totalDelivered);
+  }
+
+  return { totalSent, totalDelivered };
 }
 
 export function mergeActivityFiles(parsedFiles: ParsedCsvFile[]): LeadRow[] {
@@ -400,20 +498,21 @@ export function mergeActivityFiles(parsedFiles: ParsedCsvFile[]): LeadRow[] {
     }
   }
 
-  const deliveredFile = parsedFiles.find((file) => file.activityType === "delivered");
+  const baselineFile =
+    parsedFiles.find((file) => file.activityType === "delivered") ??
+    parsedFiles.find((file) => file.activityType === "sent");
   const allRows = [...merged.values()];
 
-  if (!deliveredFile) {
+  if (!baselineFile) {
     return allRows;
   }
 
-  const deliveredEmails = new Set(
-    deliveredFile.rows.map((row) => row.email.toLowerCase()),
+  const baselineEmails = new Set(
+    baselineFile.rows.map((row) => row.email.toLowerCase()),
   );
 
   return allRows.filter(
-    (row) =>
-      deliveredEmails.has(row.email.toLowerCase()) || row.is_bounced === "true",
+    (row) => baselineEmails.has(row.email.toLowerCase()) || row.is_bounced === "true",
   );
 }
 

@@ -16,6 +16,7 @@ interface ConvertedFile {
   base64: string;
   stats: {
     totalSent: number;
+    totalDelivered: number;
     opens: number;
     clicks: number;
     hardBounces: number;
@@ -572,6 +573,10 @@ export default function ConverterPage() {
                             <p className="text-[10px] text-muted">Sent</p>
                           </div>
                           <div className="rounded-lg bg-surface-muted px-2.5 py-2 text-center">
+                            <p className="text-sm font-semibold">{file.stats.totalDelivered}</p>
+                            <p className="text-[10px] text-muted">Delivered</p>
+                          </div>
+                          <div className="rounded-lg bg-surface-muted px-2.5 py-2 text-center">
                             <p className="text-sm font-semibold">{file.stats.opens}</p>
                             <p className="text-[10px] text-muted">Opens</p>
                           </div>
@@ -584,6 +589,10 @@ export default function ConverterPage() {
                               {file.stats.hardBounces + file.stats.softBounces}
                             </p>
                             <p className="text-[10px] text-muted">Bounces</p>
+                          </div>
+                          <div className="rounded-lg bg-surface-muted px-2.5 py-2 text-center">
+                            <p className="text-sm font-semibold">{file.stats.unsubscribes}</p>
+                            <p className="text-[10px] text-muted">Unsubs</p>
                           </div>
                         </div>
                         <button

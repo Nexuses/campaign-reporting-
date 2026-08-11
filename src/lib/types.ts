@@ -23,6 +23,7 @@ export interface ConvertOptions {
   campaignName: string;
   edmLabel?: string;
   totalSentOverride?: number;
+  totalDeliveredOverride?: number;
 }
 
 export interface ConvertResult {
@@ -30,6 +31,7 @@ export interface ConvertResult {
   buffer: Buffer;
   stats: {
     totalSent: number;
+    totalDelivered: number;
     opens: number;
     clicks: number;
     hardBounces: number;

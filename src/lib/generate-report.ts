@@ -277,7 +277,7 @@ function buildSummarySheet(
   const lastColumn = 7;
   setColumnWidths(worksheet, [3, 30, 16, 12, 13, 14, 20, 8.71]);
 
-  const delivered = stats.totalSent - stats.hardBounces - stats.softBounces;
+  const delivered = stats.totalDelivered;
   const openRate = pct(stats.opens, delivered);
   const clickRate = pct(stats.clicks, delivered);
   const clickToOpenRate = pct(stats.clicks, stats.opens);
@@ -480,12 +480,21 @@ function buildSummarySheet(
 function computeStats(
   rows: LeadRow[],
   totalSentOverride?: number,
+  totalDeliveredOverride?: number,
 ): ConvertResult["stats"] {
   const hardBounces = rows.filter((row) => classifyBounce(row) === "hard").length;
   const softBounces = rows.filter((row) => classifyBounce(row) === "soft").length;
+  const uniqueLeadCount = new Set(rows.map((row) => row.email.toLowerCase())).size;
+  const computedSent = totalSentOverride ?? uniqueLeadCount;
+  const computedDelivered =
+    totalDeliveredOverride ?? computedSent - hardBounces - softBounces;
+
+  const totalSent = Math.max(0, computedSent);
+  const totalDelivered = Math.min(totalSent, Math.max(0, computedDelivered));
 
   return {
-    totalSent: totalSentOverride ?? rows.length,
+    totalSent,
+    totalDelivered,
     opens: rows.filter((row) => parseBool(row.is_opened)).length,
     clicks: rows.filter((row) => parseBool(row.is_clicked)).length,
     hardBounces,
@@ -499,7 +508,11 @@ export async function convertLeadsToReport(
   inputFileName: string,
   options: ConvertOptions,
 ): Promise<ConvertResult> {
-  const stats = computeStats(rows, options.totalSentOverride);
+  const stats = computeStats(
+    rows,
+    options.totalSentOverride,
+    options.totalDeliveredOverride,
+  );
   const campaignName = options.campaignName.trim() || "Campaign Report";
   const edmLabel = options.edmLabel?.trim() || "EDM 1";
 
