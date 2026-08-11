@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import {
   campaignNameFromFileName,
   describeCsvFormat,
+  applyOpenAndClickEngagement,
   mergeActivityFiles,
   parseCsvContent,
+  resolveOpenAndClickCounts,
   resolveSentAndDeliveredCounts,
 } from "@/lib/csv-utils";
 import { convertLeadsToReport } from "@/lib/generate-report";
@@ -86,11 +88,13 @@ export async function POST(request: Request) {
     const fileNames = parsedFiles.map((file) => file.fileName);
     const campaignName = resolveCampaignName(fileNames, campaignNames);
     const converted: ConvertedFilePayload[] = [];
+    const counts = resolveSentAndDeliveredCounts(parsedFiles);
+    const engagement = resolveOpenAndClickCounts(parsedFiles);
 
     if (parsedFiles.length === 1) {
       const parsed = parsedFiles[0];
-      const counts = resolveSentAndDeliveredCounts(parsedFiles);
-      const result = await convertLeadsToReport(parsed.rows, parsed.fileName, {
+      const rows = applyOpenAndClickEngagement(parsed.rows, engagement);
+      const result = await convertLeadsToReport(rows, parsed.fileName, {
         campaignName,
         edmLabel,
         totalSentOverride: counts.totalSent,
@@ -104,9 +108,11 @@ export async function POST(request: Request) {
         stats: result.stats,
       });
     } else {
-      const mergedRows = mergeActivityFiles(parsedFiles);
+      const mergedRows = applyOpenAndClickEngagement(
+        mergeActivityFiles(parsedFiles),
+        engagement,
+      );
       const sourceFileName = fileNames.join(", ");
-      const counts = resolveSentAndDeliveredCounts(parsedFiles);
       const result = await convertLeadsToReport(mergedRows, fileNames[0] ?? "merged-campaign.csv", {
         campaignName,
         edmLabel,

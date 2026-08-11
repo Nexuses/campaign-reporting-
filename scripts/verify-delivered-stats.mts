@@ -1,8 +1,10 @@
 import ExcelJS from "exceljs";
 import {
+  applyOpenAndClickEngagement,
   extractActivityType,
   mergeActivityFiles,
   parseCsvContent,
+  resolveOpenAndClickCounts,
   resolveSentAndDeliveredCounts,
 } from "../src/lib/csv-utils";
 import { convertLeadsToReport } from "../src/lib/generate-report";
@@ -55,6 +57,8 @@ function activityCsv(
 async function readSummaryCounts(buffer: Buffer): Promise<{
   totalSent: number;
   totalDelivered: number;
+  totalOpens: number;
+  totalClicks: number;
 }> {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
@@ -65,15 +69,45 @@ async function readSummaryCounts(buffer: Buffer): Promise<{
 
   let totalSent = -1;
   let totalDelivered = -1;
+  let totalOpens = -1;
+  let totalClicks = -1;
 
   sheet.eachRow((row) => {
     const metric = String(row.getCell(2).value ?? "");
     const count = Number(row.getCell(3).value ?? NaN);
     if (metric === "Total Sent") totalSent = count;
     if (metric === "Total Delivered") totalDelivered = count;
+    if (metric === "Total Opens") totalOpens = count;
+    if (metric === "Total Clicks") totalClicks = count;
   });
 
-  return { totalSent, totalDelivered };
+  return { totalSent, totalDelivered, totalOpens, totalClicks };
+}
+
+async function readOpensClicksListedCounts(buffer: Buffer): Promise<{
+  listedOpens: number;
+  listedClicks: number;
+}> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const sheet = workbook.getWorksheet("Opens & Clicks");
+  if (!sheet) {
+    throw new Error("Opens & Clicks sheet missing");
+  }
+
+  let listedClicks = 0;
+  let listedOpensOnly = 0;
+
+  sheet.eachRow((row) => {
+    const status = String(row.getCell(12).value ?? "");
+    if (status === "Clicked") listedClicks += 1;
+    if (status === "Opened") listedOpensOnly += 1;
+  });
+
+  return {
+    listedOpens: listedClicks + listedOpensOnly,
+    listedClicks,
+  };
 }
 
 async function runCase(
@@ -82,7 +116,10 @@ async function runCase(
   expected: Expectation,
 ) {
   const parsedFiles = files.map((file) => parseCsvContent(file.content, file.fileName));
-  const mergedRows = mergeActivityFiles(parsedFiles);
+  const mergedRows = applyOpenAndClickEngagement(
+    mergeActivityFiles(parsedFiles),
+    resolveOpenAndClickCounts(parsedFiles),
+  );
   const counts = resolveSentAndDeliveredCounts(parsedFiles);
   const result = await convertLeadsToReport(mergedRows, files[0]?.fileName ?? "merged.csv", {
     campaignName: "Accuracy Test",
@@ -101,6 +138,22 @@ async function runCase(
   const excel = await readSummaryCounts(result.buffer);
   assertEqual(`${name} excel Total Sent`, excel.totalSent, expected.totalSent);
   assertEqual(`${name} excel Total Delivered`, excel.totalDelivered, expected.totalDelivered);
+  assertEqual(`${name} excel Total Opens`, excel.totalOpens, expected.opens);
+  assertEqual(`${name} excel Total Clicks`, excel.totalClicks, expected.clicks);
+
+  const listed = await readOpensClicksListedCounts(result.buffer);
+  assertEqual(`${name} sheet listed opens`, listed.listedOpens, expected.opens);
+  assertEqual(`${name} sheet listed clicks`, listed.listedClicks, expected.clicks);
+  assertEqual(
+    `${name} summary vs opens-sheet opens`,
+    excel.totalOpens,
+    listed.listedOpens,
+  );
+  assertEqual(
+    `${name} summary vs opens-sheet clicks`,
+    excel.totalClicks,
+    listed.listedClicks,
+  );
 
   // Core accuracy invariant for this bug
   if (result.stats.totalDelivered === result.stats.totalSent && expected.totalDelivered !== expected.totalSent) {
@@ -371,8 +424,10 @@ async function main() {
     ].join("\n");
 
     const parsed = parseCsvContent(leadsContent, "leads-campaign-500.csv");
+    const engagement = resolveOpenAndClickCounts([parsed]);
+    const rows = applyOpenAndClickEngagement(parsed.rows, engagement);
     const counts = resolveSentAndDeliveredCounts([parsed]);
-    const result = await convertLeadsToReport(parsed.rows, parsed.fileName, {
+    const result = await convertLeadsToReport(rows, parsed.fileName, {
       campaignName: "Leads Test",
       edmLabel: "EDM 1",
       totalSentOverride: counts.totalSent,
@@ -389,11 +444,52 @@ async function main() {
     const excel = await readSummaryCounts(result.buffer);
     assertEqual("leads excel Total Sent", excel.totalSent, 5);
     assertEqual("leads excel Total Delivered", excel.totalDelivered, 3);
+    assertEqual("leads excel Total Opens", excel.totalOpens, 2);
+    assertEqual("leads excel Total Clicks", excel.totalClicks, 1);
+    const listed = await readOpensClicksListedCounts(result.buffer);
+    assertEqual("leads sheet listed opens", listed.listedOpens, 2);
+    assertEqual("leads sheet listed clicks", listed.listedClicks, 1);
     console.log("PASS  leads-campaign single file");
     console.log(
       `      Sent=${result.stats.totalSent} Delivered=${result.stats.totalDelivered} Opens=${result.stats.opens} Clicks=${result.stats.clicks} Hard=${result.stats.hardBounces} Soft=${result.stats.softBounces}`,
     );
   }
+
+  // Case F: click without open flag + opener outside delivered must stay consistent
+  await runCase(
+    "opens/clicks stay aligned across sheets",
+    [
+      {
+        fileName: "campaign-id-600-delivered.csv",
+        content: activityCsv(
+          [{ email: "a@ex.com" }, { email: "b@ex.com" }],
+          "delivered_at",
+        ),
+      },
+      {
+        fileName: "campaign-id-600-opened.csv",
+        content: activityCsv(
+          // c is opened but missing from delivered export
+          [{ email: "a@ex.com" }, { email: "c@ex.com" }],
+          "opened_at",
+        ),
+      },
+      {
+        fileName: "campaign-id-600-clicked.csv",
+        content: activityCsv([{ email: "a@ex.com" }, { email: "d@ex.com" }], "clicked_at"),
+      },
+    ],
+    {
+      name: "opens/clicks stay aligned across sheets",
+      totalSent: 2,
+      totalDelivered: 2,
+      // a (open+click), c (open), d (click=>open) = 3 opens, 2 clicks
+      opens: 3,
+      clicks: 2,
+      hardBounces: 0,
+      softBounces: 0,
+    },
+  );
 
   console.log("\nAll delivered/sent accuracy checks passed.");
 }

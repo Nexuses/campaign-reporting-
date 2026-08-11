@@ -22,12 +22,68 @@ import {
   formatDisplayDate,
   formatPersonName,
   getCampaignDate,
+  hasClicked,
+  hasOpened,
   parseBool,
   parseSentTime,
   pct,
 } from "./lead-utils";
 import type { ConvertOptions, ConvertResult, LeadRow } from "./types";
 import { outputFileName } from "./csv-utils";
+
+function uniqueLeadsByEmail(rows: LeadRow[]): LeadRow[] {
+  const byEmail = new Map<string, LeadRow>();
+  for (const row of rows) {
+    const key = row.email.trim().toLowerCase();
+    if (!key) continue;
+    const existing = byEmail.get(key);
+    if (!existing) {
+      byEmail.set(key, {
+        ...row,
+        is_opened: hasOpened(row) ? "true" : "false",
+        is_clicked: hasClicked(row) ? "true" : "false",
+      });
+      continue;
+    }
+
+    if (hasOpened(row)) existing.is_opened = "true";
+    if (hasClicked(row)) {
+      existing.is_clicked = "true";
+      existing.is_opened = "true";
+    }
+    if (parseBool(row.is_bounced)) {
+      existing.is_bounced = "true";
+      if (row.lead_category) existing.lead_category = row.lead_category;
+    }
+    if (parseBool(row.is_unsubscribed)) existing.is_unsubscribed = "true";
+    if (row.first_name) existing.first_name = row.first_name;
+    if (row.last_name) existing.last_name = row.last_name;
+    if (row.sent_time) existing.sent_time = row.sent_time;
+  }
+  return [...byEmail.values()];
+}
+
+/**
+ * Single source of truth for Opens & Clicks sheet + Summary metrics.
+ * clickers + opensOnly === opens, and clicks === clickers.length.
+ */
+function partitionOpensAndClicks(rows: LeadRow[]): {
+  clickers: LeadRow[];
+  opensOnly: LeadRow[];
+  opens: number;
+  clicks: number;
+} {
+  const uniqueRows = uniqueLeadsByEmail(rows);
+  const clickers = uniqueRows.filter((row) => hasClicked(row));
+  const opensOnly = uniqueRows.filter((row) => hasOpened(row) && !hasClicked(row));
+
+  return {
+    clickers,
+    opensOnly,
+    opens: clickers.length + opensOnly.length,
+    clicks: clickers.length,
+  };
+}
 
 function compareRate(
   ratePercent: number,
@@ -72,6 +128,10 @@ function buildOpensAndClicksSheet(
   campaignName: string,
   edmLabel: string,
   stats: ConvertResult["stats"],
+  engagement: {
+    clickers: LeadRow[];
+    opensOnly: LeadRow[];
+  },
 ) {
   const worksheet = workbook.addWorksheet("Opens & Clicks");
   const lastColumn = 12;
@@ -85,12 +145,7 @@ function buildOpensAndClicksSheet(
     lastColumn,
   );
 
-  const clickers = rows.filter(
-    (row) => parseBool(row.is_opened) && parseBool(row.is_clicked),
-  );
-  const opensOnly = rows.filter(
-    (row) => parseBool(row.is_opened) && !parseBool(row.is_clicked),
-  );
+  const { clickers, opensOnly } = engagement;
 
   let currentRow = 6;
   writeSectionLabel(
@@ -434,12 +489,12 @@ function buildSummarySheet(
       totalOpens: 0,
     };
 
-    if (parseBool(lead.is_opened)) {
+    if (hasOpened(lead)) {
       existing.opened += 1;
       existing.totalOpens += 1;
     }
 
-    if (parseBool(lead.is_clicked)) {
+    if (hasClicked(lead)) {
       existing.clicked += 1;
     }
 
@@ -481,10 +536,17 @@ function computeStats(
   rows: LeadRow[],
   totalSentOverride?: number,
   totalDeliveredOverride?: number,
-): ConvertResult["stats"] {
-  const hardBounces = rows.filter((row) => classifyBounce(row) === "hard").length;
-  const softBounces = rows.filter((row) => classifyBounce(row) === "soft").length;
-  const uniqueLeadCount = new Set(rows.map((row) => row.email.toLowerCase())).size;
+): ConvertResult["stats"] & {
+  engagement: {
+    clickers: LeadRow[];
+    opensOnly: LeadRow[];
+  };
+} {
+  const uniqueRows = uniqueLeadsByEmail(rows);
+  const hardBounces = uniqueRows.filter((row) => classifyBounce(row) === "hard").length;
+  const softBounces = uniqueRows.filter((row) => classifyBounce(row) === "soft").length;
+  const engagement = partitionOpensAndClicks(uniqueRows);
+  const uniqueLeadCount = uniqueRows.length;
   const computedSent = totalSentOverride ?? uniqueLeadCount;
   const computedDelivered =
     totalDeliveredOverride ?? computedSent - hardBounces - softBounces;
@@ -495,11 +557,16 @@ function computeStats(
   return {
     totalSent,
     totalDelivered,
-    opens: rows.filter((row) => parseBool(row.is_opened)).length,
-    clicks: rows.filter((row) => parseBool(row.is_clicked)).length,
+    opens: engagement.opens,
+    clicks: engagement.clicks,
     hardBounces,
     softBounces,
-    unsubscribes: rows.filter((row) => parseBool(row.is_unsubscribed ?? "false")).length,
+    unsubscribes: uniqueRows.filter((row) => parseBool(row.is_unsubscribed ?? "false"))
+      .length,
+    engagement: {
+      clickers: engagement.clickers,
+      opensOnly: engagement.opensOnly,
+    },
   };
 }
 
@@ -508,21 +575,33 @@ export async function convertLeadsToReport(
   inputFileName: string,
   options: ConvertOptions,
 ): Promise<ConvertResult> {
-  const stats = computeStats(
-    rows,
+  const normalizedRows = uniqueLeadsByEmail(rows);
+  const { engagement, ...stats } = computeStats(
+    normalizedRows,
     options.totalSentOverride,
     options.totalDeliveredOverride,
   );
   const campaignName = options.campaignName.trim() || "Campaign Report";
   const edmLabel = options.edmLabel?.trim() || "EDM 1";
 
+  // Guard: Summary metrics must equal Opens & Clicks listed rows.
+  stats.opens = engagement.clickers.length + engagement.opensOnly.length;
+  stats.clicks = engagement.clickers.length;
+
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "Campaign Report Converter";
   workbook.created = new Date();
 
-  buildOpensAndClicksSheet(workbook, rows, campaignName, edmLabel, stats);
-  buildBouncesSheet(workbook, rows, campaignName, edmLabel, stats);
-  buildSummarySheet(workbook, rows, campaignName, edmLabel, stats);
+  buildOpensAndClicksSheet(
+    workbook,
+    normalizedRows,
+    campaignName,
+    edmLabel,
+    stats,
+    engagement,
+  );
+  buildBouncesSheet(workbook, normalizedRows, campaignName, edmLabel, stats);
+  buildSummarySheet(workbook, normalizedRows, campaignName, edmLabel, stats);
 
   const arrayBuffer = await workbook.xlsx.writeBuffer();
   const buffer = Buffer.from(arrayBuffer);
