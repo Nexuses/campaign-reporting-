@@ -4,8 +4,8 @@ import {
   mergeActivityFiles,
   parseCsvContent,
   resolveSentAndDeliveredCounts,
-} from "../src/lib/csv-utils.ts";
-import { convertLeadsToReport } from "../src/lib/generate-report.ts";
+} from "../src/lib/csv-utils";
+import { convertLeadsToReport } from "../src/lib/generate-report";
 
 type Expectation = {
   name: string;
