@@ -3,7 +3,11 @@ import type { LeadRow } from "./types";
 
 type RawRow = Record<string, string | undefined>;
 
-export type CsvFormat = "leads-campaign" | "activity" | "brevo-campaign";
+export type CsvFormat =
+  | "leads-campaign"
+  | "activity"
+  | "brevo-campaign"
+  | "sequence-export";
 
 export type ActivityType =
   | "sent"
@@ -48,6 +52,7 @@ export interface ParsedCsvFile {
   rows: LeadRow[];
   campaignId?: string;
   activityType?: ActivityType;
+  sentCount?: number;
 }
 
 function normalizeKey(key: string): string {
@@ -94,7 +99,36 @@ function detectFormat(headers: string[]): CsvFormat {
     return "activity";
   }
 
+  if (
+    normalized.includes("email") &&
+    (normalized.includes("sentat") || normalized.includes("openedat")) &&
+    (normalized.includes("firstname") || normalized.includes("companyname"))
+  ) {
+    return "sequence-export";
+  }
+
   return "leads-campaign";
+}
+
+function rowWasSent(row: RawRow): boolean {
+  return valuesForKeyPattern(row, /^sentat\d*$/).length > 0;
+}
+
+function valuesForKeyPattern(row: RawRow, pattern: RegExp): string[] {
+  return Object.entries(row)
+    .filter(([key, value]) => pattern.test(normalizeKey(key)) && value?.trim())
+    .map(([, value]) => value!.trim());
+}
+
+function earliestTimestamp(values: string[]): string {
+  if (values.length === 0) {
+    return "";
+  }
+
+  const sorted = [...values].sort(
+    (left, right) => new Date(left).getTime() - new Date(right).getTime(),
+  );
+  return sorted[0] ?? "";
 }
 
 function inferActivityTypeFromHeaders(headers: string[]): ActivityType {
@@ -243,12 +277,64 @@ export function activityTypeLabelFromFileName(fileName: string): string {
     return "Leads export";
   }
 
+  if (/^fil_/i.test(fileName) || /sentat|openedat/i.test(fileName)) {
+    return "Sequence export";
+  }
+
   const activityType = extractActivityType(fileName);
   if (activityType !== "unknown") {
     return activityTypeLabel(activityType);
   }
 
   return "Campaign CSV";
+}
+
+function normalizeSequenceExportRow(row: RawRow): LeadRow | null {
+  const email = pickValue(row, ["email"]);
+  if (!email) {
+    return null;
+  }
+
+  const sentTimes = valuesForKeyPattern(row, /^sentat\d*$/);
+  const openedTimes = valuesForKeyPattern(row, /^openedat\d*$/);
+  const clickedTimes = valuesForKeyPattern(row, /^clickedat\d*$/);
+  const bouncedTimes = valuesForKeyPattern(row, /^bouncedat\d*$/);
+  const unsubTimes = valuesForKeyPattern(row, /^unsubscribedat\d*$/);
+  const repliedTimes = valuesForKeyPattern(row, /^repliedat\d*$/);
+  const failedMessages = valuesForKeyPattern(row, /^failedmessage\d*$/);
+
+  const isOpened = openedTimes.length > 0 || clickedTimes.length > 0 ? "true" : "false";
+  const isClicked = clickedTimes.length > 0 ? "true" : "false";
+  const isBounced = bouncedTimes.length > 0 ? "true" : "false";
+  const isUnsubscribed = unsubTimes.length > 0 ? "true" : "false";
+  const gotReply = repliedTimes.length > 0 ? "true" : "false";
+
+  const sentTime =
+    earliestTimestamp(sentTimes) ||
+    earliestTimestamp(openedTimes) ||
+    earliestTimestamp(clickedTimes) ||
+    earliestTimestamp(bouncedTimes);
+
+  return {
+    email,
+    first_name: pickValue(row, ["firstname", "first_name"]),
+    last_name: pickValue(row, ["lastname", "last_name"]),
+    company_name: pickValue(row, ["companyname", "company_name"]),
+    phone_number: pickValue(row, ["phone", "phone_number"]),
+    website: pickValue(row, ["companydomain", "website"]),
+    location: pickValue(row, ["location"]),
+    linkedin_profile: pickValue(row, ["linkedinurl", "linkedin_profile"]),
+    lead_status: pickValue(row, ["jobtitle", "lead_status"]),
+    current_seq_num: pickValue(row, ["sentstep", "current_seq_num"]),
+    email_account: pickValue(row, ["senduser", "email_account"]),
+    lead_category: failedMessages[0] ?? "",
+    is_opened: isOpened,
+    is_clicked: isClicked,
+    is_bounced: isBounced,
+    is_unsubscribed: isUnsubscribed,
+    got_reply: gotReply,
+    sent_time: sentTime,
+  };
 }
 
 function normalizeLeadsCampaignRow(row: RawRow): LeadRow | null {
@@ -396,9 +482,18 @@ export function parseCsvContent(content: string, fileName: string): ParsedCsvFil
         ? result.data
             .map(normalizeBrevoCampaignRow)
             .filter((row): row is LeadRow => row !== null)
-        : result.data
-            .map(normalizeLeadsCampaignRow)
-            .filter((row): row is LeadRow => row !== null);
+        : format === "sequence-export"
+          ? result.data
+              .map(normalizeSequenceExportRow)
+              .filter((row): row is LeadRow => row !== null)
+          : result.data
+              .map(normalizeLeadsCampaignRow)
+              .filter((row): row is LeadRow => row !== null);
+
+  const sentCount =
+    format === "sequence-export"
+      ? result.data.filter((row) => rowWasSent(row)).length
+      : undefined;
 
   return {
     fileName,
@@ -406,6 +501,7 @@ export function parseCsvContent(content: string, fileName: string): ParsedCsvFil
     rows,
     campaignId,
     activityType,
+    sentCount,
   };
 }
 
@@ -432,11 +528,15 @@ export function deliveredCountFromFiles(parsedFiles: ParsedCsvFile[]): number | 
 
 export function sentCountFromFiles(parsedFiles: ParsedCsvFile[]): number | undefined {
   const sentFile = parsedFiles.find((file) => file.activityType === "sent");
-  if (!sentFile) {
-    return undefined;
+  if (sentFile) {
+    return uniqueEmailCount(sentFile.rows);
   }
 
-  return uniqueEmailCount(sentFile.rows);
+  const sequenceSent = parsedFiles
+    .filter((file) => file.format === "sequence-export")
+    .reduce((total, file) => total + (file.sentCount ?? 0), 0);
+
+  return sequenceSent > 0 ? sequenceSent : undefined;
 }
 
 function uniqueEmailsFromActivity(
@@ -506,7 +606,12 @@ export function resolveOpenAndClickCounts(parsedFiles: ParsedCsvFile[]): {
   const clickedEmails = new Set<string>();
 
   for (const file of parsedFiles) {
-    if (file.format !== "activity" && file.format !== "leads-campaign" && file.format !== "brevo-campaign") {
+    if (
+      file.format !== "activity" &&
+      file.format !== "leads-campaign" &&
+      file.format !== "brevo-campaign" &&
+      file.format !== "sequence-export"
+    ) {
       continue;
     }
 
@@ -719,8 +824,13 @@ export function campaignNameFromFileName(fileName: string): string {
     return `Campaign ${leadsMatch[1]} Report`;
   }
 
-  return base
+  const sequenceMatch = base.match(/^fil_[^_]+_(.+)$/i);
+  let cleanedBase = sequenceMatch?.[1] ?? base;
+  cleanedBase = cleanedBase.replace(/^[a-z0-9]+_/i, "");
+
+  return cleanedBase
     .replace(/^\d+\.\s*/, "")
+    .replace(/\s*\(\d+\)\s*$/, "")
     .replace(/[-_]+/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
@@ -767,6 +877,10 @@ export function describeCsvFormat(content: string): string {
 
   if (format === "brevo-campaign") {
     return "Brevo campaign export (Email_ID, Open_Date, etc.)";
+  }
+
+  if (format === "sequence-export") {
+    return "sequence export (email, firstName, sentAt, openedAt, etc.)";
   }
 
   return "leads campaign export (email, first_name, is_opened, etc.)";
