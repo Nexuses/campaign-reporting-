@@ -1,7 +1,16 @@
 import type { LeadRow } from "./types";
 
 export function parseBool(value: string | undefined): boolean {
-  return value?.toLowerCase() === "true";
+  return value?.trim().toLowerCase() === "true";
+}
+
+export function hasClicked(row: LeadRow): boolean {
+  return parseBool(row.is_clicked);
+}
+
+/** Click always implies an open for reporting consistency. */
+export function hasOpened(row: LeadRow): boolean {
+  return parseBool(row.is_opened) || hasClicked(row);
 }
 
 export function extractDomain(email: string): string {

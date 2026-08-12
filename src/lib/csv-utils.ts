@@ -6,6 +6,7 @@ type RawRow = Record<string, string | undefined>;
 export type CsvFormat = "leads-campaign" | "activity" | "brevo-campaign";
 
 export type ActivityType =
+  | "sent"
   | "delivered"
   | "opened"
   | "not-opened"
@@ -15,22 +16,30 @@ export type ActivityType =
   | "unknown";
 
 const ACTIVITY_FILE_PATTERNS: Array<{ type: ActivityType; pattern: RegExp }> = [
-  { type: "not-opened", pattern: /not[-_]opened/i },
+  { type: "sent", pattern: /(?:^|[-_\s])sent(?:$|[-_\s.]|\.csv)/i },
+  { type: "not-opened", pattern: /not[-_\s]?opened/i },
   { type: "delivered", pattern: /delivered/i },
-  { type: "clicked", pattern: /clicked|click[-_]activities/i },
-  { type: "opened", pattern: /opened/i },
+  {
+    type: "clicked",
+    pattern: /(?:link[-_\s]?)?clicked|click[-_\s]?activities|(?:^|[-_\s])clicks?(?:$|[-_\s.]|\.csv)/i,
+  },
+  {
+    type: "opened",
+    pattern: /(?:email[-_\s]?)?opened|(?:^|[-_\s])opens?(?:$|[-_\s.]|\.csv)/i,
+  },
   { type: "bounced", pattern: /bounced|bounce[-_]activities/i },
   { type: "unsubscribed", pattern: /unsubscribed|unsubscribe/i },
 ];
 
 const ACTIVITY_MERGE_ORDER: Record<ActivityType, number> = {
-  delivered: 0,
-  opened: 1,
-  clicked: 2,
-  "not-opened": 3,
-  bounced: 4,
-  unsubscribed: 5,
-  unknown: 6,
+  sent: 0,
+  delivered: 1,
+  opened: 2,
+  clicked: 3,
+  "not-opened": 4,
+  bounced: 5,
+  unsubscribed: 6,
+  unknown: 7,
 };
 
 export interface ParsedCsvFile {
@@ -42,7 +51,11 @@ export interface ParsedCsvFile {
 }
 
 function normalizeKey(key: string): string {
-  return key.trim().toLowerCase().replace(/\s+/g, "_");
+  return key
+    .trim()
+    .replace(/^\uFEFF/, "")
+    .toLowerCase()
+    .replace(/\s+/g, "_");
 }
 
 function pickValue(row: RawRow, keys: string[]): string {
@@ -82,6 +95,24 @@ function detectFormat(headers: string[]): CsvFormat {
   }
 
   return "leads-campaign";
+}
+
+function inferActivityTypeFromHeaders(headers: string[]): ActivityType {
+  const normalized = headers.map(normalizeKey);
+
+  const matches: ActivityType[] = [];
+  if (normalized.includes("clicked_at")) matches.push("clicked");
+  if (normalized.includes("opened_at") && !normalized.includes("clicked_at")) {
+    matches.push("opened");
+  }
+  if (normalized.includes("bounced_at")) matches.push("bounced");
+  if (normalized.includes("unsubscribed_at")) matches.push("unsubscribed");
+  if (normalized.includes("delivered_at")) matches.push("delivered");
+  if (normalized.includes("sent_at")) matches.push("sent");
+
+  // Only infer when exactly one activity timestamp column is present,
+  // otherwise filename (or unknown) is safer than a wrong guess.
+  return matches.length === 1 ? matches[0] : "unknown";
 }
 
 function normalizeBrevoDate(value: string): string {
@@ -184,6 +215,8 @@ export function extractActivityType(fileName: string): ActivityType {
 
 export function activityTypeLabel(activityType: ActivityType): string {
   switch (activityType) {
+    case "sent":
+      return "Sent";
     case "delivered":
       return "Delivered";
     case "opened":
@@ -246,6 +279,36 @@ function normalizeLeadsCampaignRow(row: RawRow): LeadRow | null {
   };
 }
 
+function inferActivityTypeFromRow(
+  row: RawRow,
+  fileActivityType: ActivityType,
+): ActivityType {
+  if (fileActivityType !== "unknown") {
+    return fileActivityType;
+  }
+
+  const event = pickValue(row, [
+    "event_type",
+    "event",
+    "activity",
+    "activity_type",
+    "type",
+    "status",
+  ]).toLowerCase();
+
+  if (!event) {
+    return "unknown";
+  }
+  if (/not[-_\s]?open/.test(event)) return "not-opened";
+  if (/click/.test(event)) return "clicked";
+  if (/open/.test(event)) return "opened";
+  if (/bounc/.test(event)) return "bounced";
+  if (/unsub|opt[-_\s]?out/.test(event)) return "unsubscribed";
+  if (/deliver/.test(event)) return "delivered";
+  if (/(^|[^a-z])sent([^a-z]|$)|email sent/.test(event)) return "sent";
+  return "unknown";
+}
+
 function normalizeActivityRow(row: RawRow, activityType: ActivityType): LeadRow | null {
   const email = pickValue(row, ["email_address", "email"]);
   if (!email) {
@@ -257,9 +320,14 @@ function normalizeActivityRow(row: RawRow, activityType: ActivityType): LeadRow 
   const sentTime = pickValue(row, [
     "delivered_at",
     "opened_at",
+    "clicked_at",
     "bounced_at",
     "unsubscribed_at",
+    "sent_at",
     "sent_time",
+    "timestamp",
+    "time",
+    "date",
   ]);
   const bounceType = pickValue(row, ["bounce_type"]);
   const bounceDetails = pickValue(row, ["bounce_details"]);
@@ -311,12 +379,18 @@ export function parseCsvContent(content: string, fileName: string): ParsedCsvFil
   const headers = result.meta.fields ?? [];
   const format = detectFormat(headers);
   const campaignId = extractCampaignId(fileName);
-  const activityType = extractActivityType(fileName);
+  const fileNameActivityType = extractActivityType(fileName);
+  const activityType =
+    format === "activity" && fileNameActivityType === "unknown"
+      ? inferActivityTypeFromHeaders(headers)
+      : fileNameActivityType;
 
   const rows =
     format === "activity"
       ? result.data
-          .map((row) => normalizeActivityRow(row, activityType))
+          .map((row) =>
+            normalizeActivityRow(row, inferActivityTypeFromRow(row, activityType)),
+          )
           .filter((row): row is LeadRow => row !== null)
       : format === "brevo-campaign"
         ? result.data
@@ -343,9 +417,211 @@ interface MergedLead extends LeadRow {
   is_unsubscribed: string;
 }
 
+function uniqueEmailCount(rows: LeadRow[]): number {
+  return new Set(rows.map((row) => row.email.toLowerCase())).size;
+}
+
 export function deliveredCountFromFiles(parsedFiles: ParsedCsvFile[]): number | undefined {
   const deliveredFile = parsedFiles.find((file) => file.activityType === "delivered");
-  return deliveredFile?.rows.length;
+  if (!deliveredFile) {
+    return undefined;
+  }
+
+  return uniqueEmailCount(deliveredFile.rows);
+}
+
+export function sentCountFromFiles(parsedFiles: ParsedCsvFile[]): number | undefined {
+  const sentFile = parsedFiles.find((file) => file.activityType === "sent");
+  if (!sentFile) {
+    return undefined;
+  }
+
+  return uniqueEmailCount(sentFile.rows);
+}
+
+function uniqueEmailsFromActivity(
+  parsedFiles: ParsedCsvFile[],
+  activityType: ActivityType,
+): Set<string> {
+  const emails = new Set<string>();
+  for (const file of parsedFiles) {
+    if (file.activityType !== activityType) {
+      continue;
+    }
+    for (const row of file.rows) {
+      emails.add(row.email.toLowerCase());
+    }
+  }
+  return emails;
+}
+
+/**
+ * Resolve Sent vs Delivered independently.
+ * - Sent: explicit sent file, else unique(delivered ∪ bounced)
+ * - Delivered: explicit delivered file when present
+ */
+export function resolveSentAndDeliveredCounts(parsedFiles: ParsedCsvFile[]): {
+  totalSent?: number;
+  totalDelivered?: number;
+} {
+  const sentFromFile = sentCountFromFiles(parsedFiles);
+  const deliveredFromFile = deliveredCountFromFiles(parsedFiles);
+
+  const deliveredEmails = uniqueEmailsFromActivity(parsedFiles, "delivered");
+  const bouncedEmails = uniqueEmailsFromActivity(parsedFiles, "bounced");
+
+  let totalSent = sentFromFile;
+  if (totalSent === undefined && deliveredEmails.size > 0) {
+    const sentEmails = new Set<string>([...deliveredEmails, ...bouncedEmails]);
+    totalSent = sentEmails.size;
+  }
+
+  let totalDelivered = deliveredFromFile;
+  if (
+    totalDelivered === undefined &&
+    totalSent !== undefined &&
+    bouncedEmails.size > 0
+  ) {
+    totalDelivered = Math.max(0, totalSent - bouncedEmails.size);
+  }
+
+  if (totalSent !== undefined && totalDelivered !== undefined) {
+    totalDelivered = Math.min(totalSent, totalDelivered);
+  }
+
+  return { totalSent, totalDelivered };
+}
+
+/**
+ * Opens/Clicks source of truth from activity files (unique emails).
+ * Click always counts as an open.
+ */
+export function resolveOpenAndClickCounts(parsedFiles: ParsedCsvFile[]): {
+  opens?: number;
+  clicks?: number;
+  openedEmails: Set<string>;
+  clickedEmails: Set<string>;
+} {
+  const openedEmails = new Set<string>();
+  const clickedEmails = new Set<string>();
+
+  for (const file of parsedFiles) {
+    if (file.format !== "activity" && file.format !== "leads-campaign" && file.format !== "brevo-campaign") {
+      continue;
+    }
+
+    for (const row of file.rows) {
+      const email = row.email.toLowerCase();
+      if (!email) continue;
+
+      // Prefer explicit activity-file classification when present.
+      if (file.activityType === "clicked" || row.is_clicked === "true") {
+        clickedEmails.add(email);
+        openedEmails.add(email);
+        continue;
+      }
+      if (file.activityType === "opened" || row.is_opened === "true") {
+        openedEmails.add(email);
+      }
+    }
+  }
+
+  // Also include dedicated activity-type sets (covers rows before flags if needed).
+  for (const email of uniqueEmailsFromActivity(parsedFiles, "clicked")) {
+    clickedEmails.add(email);
+    openedEmails.add(email);
+  }
+  for (const email of uniqueEmailsFromActivity(parsedFiles, "opened")) {
+    openedEmails.add(email);
+  }
+
+  const hasEngagementFiles = parsedFiles.some(
+    (file) => file.activityType === "opened" || file.activityType === "clicked",
+  );
+  const hasEngagementFlags = openedEmails.size > 0 || clickedEmails.size > 0;
+
+  if (!hasEngagementFiles && !hasEngagementFlags) {
+    return { openedEmails, clickedEmails };
+  }
+
+  return {
+    opens: openedEmails.size,
+    clicks: clickedEmails.size,
+    openedEmails,
+    clickedEmails,
+  };
+}
+
+/**
+ * Ensure every opened/clicked email exists in the lead rows with correct flags,
+ * so Summary counts and Opens & Clicks sheet rows cannot diverge.
+ */
+export function applyOpenAndClickEngagement(
+  rows: LeadRow[],
+  engagement: {
+    openedEmails: Set<string>;
+    clickedEmails: Set<string>;
+  },
+): LeadRow[] {
+  const { openedEmails, clickedEmails } = engagement;
+  if (openedEmails.size === 0 && clickedEmails.size === 0) {
+    return rows;
+  }
+
+  const byEmail = new Map<string, LeadRow>();
+  for (const row of rows) {
+    const key = row.email.trim().toLowerCase();
+    if (!key) continue;
+    byEmail.set(key, { ...row });
+  }
+
+  const allEmails = new Set<string>([...openedEmails, ...clickedEmails, ...byEmail.keys()]);
+  const result: LeadRow[] = [];
+
+  for (const email of allEmails) {
+    const existing = byEmail.get(email);
+    const isClicked = clickedEmails.has(email) || existing?.is_clicked === "true";
+    const isOpened =
+      openedEmails.has(email) ||
+      isClicked ||
+      existing?.is_opened === "true";
+
+    if (existing) {
+      result.push({
+        ...existing,
+        is_opened: isOpened ? "true" : "false",
+        is_clicked: isClicked ? "true" : "false",
+      });
+      continue;
+    }
+
+    if (!openedEmails.has(email) && !clickedEmails.has(email)) {
+      continue;
+    }
+
+    result.push({
+      email,
+      first_name: "",
+      last_name: "",
+      company_name: "",
+      phone_number: "",
+      website: "",
+      location: "",
+      linkedin_profile: "",
+      lead_status: "",
+      current_seq_num: "",
+      email_account: "",
+      lead_category: "",
+      is_opened: isOpened ? "true" : "false",
+      is_clicked: isClicked ? "true" : "false",
+      is_bounced: "false",
+      is_unsubscribed: "false",
+      got_reply: "false",
+      sent_time: "",
+    });
+  }
+
+  return result;
 }
 
 export function mergeActivityFiles(parsedFiles: ParsedCsvFile[]): LeadRow[] {
@@ -375,7 +651,10 @@ export function mergeActivityFiles(parsedFiles: ParsedCsvFile[]): LeadRow[] {
     if (row.sent_time && !existing.sent_time) existing.sent_time = row.sent_time;
 
     if (row.is_opened === "true") existing.is_opened = "true";
-    if (row.is_clicked === "true") existing.is_clicked = "true";
+    if (row.is_clicked === "true") {
+      existing.is_clicked = "true";
+      existing.is_opened = "true";
+    }
     if (row.is_bounced === "true") {
       existing.is_bounced = "true";
       if (row.lead_category) existing.lead_category = row.lead_category;
@@ -386,7 +665,7 @@ export function mergeActivityFiles(parsedFiles: ParsedCsvFile[]): LeadRow[] {
       if (row.sent_time) existing.sent_time = row.sent_time;
     }
 
-    if (row.is_opened === "true" && row.sent_time) {
+    if ((row.is_opened === "true" || row.is_clicked === "true") && row.sent_time) {
       existing.sent_time = row.sent_time;
     }
 
@@ -400,20 +679,26 @@ export function mergeActivityFiles(parsedFiles: ParsedCsvFile[]): LeadRow[] {
     }
   }
 
-  const deliveredFile = parsedFiles.find((file) => file.activityType === "delivered");
+  const baselineFile =
+    parsedFiles.find((file) => file.activityType === "delivered") ??
+    parsedFiles.find((file) => file.activityType === "sent");
   const allRows = [...merged.values()];
 
-  if (!deliveredFile) {
+  if (!baselineFile) {
     return allRows;
   }
 
-  const deliveredEmails = new Set(
-    deliveredFile.rows.map((row) => row.email.toLowerCase()),
+  const baselineEmails = new Set(
+    baselineFile.rows.map((row) => row.email.toLowerCase()),
   );
 
   return allRows.filter(
     (row) =>
-      deliveredEmails.has(row.email.toLowerCase()) || row.is_bounced === "true",
+      baselineEmails.has(row.email.toLowerCase()) ||
+      row.is_bounced === "true" ||
+      row.is_opened === "true" ||
+      row.is_clicked === "true" ||
+      row.is_unsubscribed === "true",
   );
 }
 

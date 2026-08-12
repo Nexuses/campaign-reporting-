@@ -2,9 +2,11 @@ import { NextResponse } from "next/server";
 import {
   campaignNameFromFileName,
   describeCsvFormat,
-  deliveredCountFromFiles,
+  applyOpenAndClickEngagement,
   mergeActivityFiles,
   parseCsvContent,
+  resolveOpenAndClickCounts,
+  resolveSentAndDeliveredCounts,
 } from "@/lib/csv-utils";
 import { convertLeadsToReport } from "@/lib/generate-report";
 
@@ -16,6 +18,7 @@ interface ConvertedFilePayload {
   base64: string;
   stats: {
     totalSent: number;
+    totalDelivered: number;
     opens: number;
     clicks: number;
     hardBounces: number;
@@ -85,12 +88,17 @@ export async function POST(request: Request) {
     const fileNames = parsedFiles.map((file) => file.fileName);
     const campaignName = resolveCampaignName(fileNames, campaignNames);
     const converted: ConvertedFilePayload[] = [];
+    const counts = resolveSentAndDeliveredCounts(parsedFiles);
+    const engagement = resolveOpenAndClickCounts(parsedFiles);
 
     if (parsedFiles.length === 1) {
       const parsed = parsedFiles[0];
-      const result = await convertLeadsToReport(parsed.rows, parsed.fileName, {
+      const rows = applyOpenAndClickEngagement(parsed.rows, engagement);
+      const result = await convertLeadsToReport(rows, parsed.fileName, {
         campaignName,
         edmLabel,
+        totalSentOverride: counts.totalSent,
+        totalDeliveredOverride: counts.totalDelivered,
       });
 
       converted.push({
@@ -100,12 +108,16 @@ export async function POST(request: Request) {
         stats: result.stats,
       });
     } else {
-      const mergedRows = mergeActivityFiles(parsedFiles);
+      const mergedRows = applyOpenAndClickEngagement(
+        mergeActivityFiles(parsedFiles),
+        engagement,
+      );
       const sourceFileName = fileNames.join(", ");
       const result = await convertLeadsToReport(mergedRows, fileNames[0] ?? "merged-campaign.csv", {
         campaignName,
         edmLabel,
-        totalSentOverride: deliveredCountFromFiles(parsedFiles),
+        totalSentOverride: counts.totalSent,
+        totalDeliveredOverride: counts.totalDelivered,
       });
 
       converted.push({
